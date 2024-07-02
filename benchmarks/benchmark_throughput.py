@@ -10,6 +10,10 @@ from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 
+from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+from vllm.utils import FlexibleArgumentParser
+
 
 def sample_requests(
     dataset_path: str,
@@ -76,8 +80,10 @@ def run_vllm(
     enable_prefix_caching: bool,
     enable_chunked_prefill: bool,
     max_num_batched_tokens: int,
+    distributed_executor_backend: Optional[str],
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
+    load_format: str = EngineArgs.load_format,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -98,28 +104,27 @@ def run_vllm(
         download_dir=download_dir,
         enable_chunked_prefill=enable_chunked_prefill,
         max_num_batched_tokens=max_num_batched_tokens,
+        distributed_executor_backend=distributed_executor_backend,
+        load_format=load_format,
     )
 
     # Add the requests to the engine.
+    prompts: List[str] = []
+    sampling_params: List[SamplingParams] = []
     for prompt, _, output_len in requests:
-        sampling_params = SamplingParams(
-            n=n,
-            temperature=0.0 if use_beam_search else 1.0,
-            top_p=1.0,
-            use_beam_search=use_beam_search,
-            ignore_eos=True,
-            max_tokens=output_len,
-        )
-        # FIXME(woosuk): Do not use internal method.
-        llm._add_request(
-            prompt=prompt,
-            prompt_token_ids=None,
-            sampling_params=sampling_params,
-        )
+        prompts.append(prompt)
+        sampling_params.append(
+            SamplingParams(
+                n=n,
+                temperature=0.0 if use_beam_search else 1.0,
+                top_p=1.0,
+                use_beam_search=use_beam_search,
+                ignore_eos=True,
+                max_tokens=output_len,
+            ))
 
     start = time.perf_counter()
-    # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
+    llm.generate(prompts, sampling_params, use_tqdm=True)
     end = time.perf_counter()
     return end - start
 
@@ -226,8 +231,8 @@ def main(args: argparse.Namespace):
             args.enforce_eager, args.kv_cache_dtype,
             args.quantization_param_path, args.device,
             args.enable_prefix_caching, args.enable_chunked_prefill,
-            args.max_num_batched_tokens, args.gpu_memory_utilization,
-            args.download_dir)
+            args.max_num_batched_tokens, args.distributed_executor_backend,
+            args.gpu_memory_utilization, args.download_dir, args.load_format)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -243,9 +248,21 @@ def main(args: argparse.Namespace):
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
 
+    # Output JSON results if specified
+    if args.output_json:
+        results = {
+            "elapsed_time": elapsed_time,
+            "num_requests": len(requests),
+            "total_num_tokens": total_num_tokens,
+            "requests_per_second": len(requests) / elapsed_time,
+            "tokens_per_second": total_num_tokens / elapsed_time,
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=4)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark the throughput.")
+    parser = FlexibleArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",
                         type=str,
                         choices=["vllm", "hf", "mii"],
@@ -267,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
-                        choices=['awq', 'gptq', 'squeezellm', None],
+                        choices=[*QUANTIZATION_METHODS, None],
                         default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--n",
@@ -312,15 +329,13 @@ if __name__ == "__main__":
                         action="store_true",
                         help="enforce eager execution")
     parser.add_argument(
-        "--kv-cache-dtype",
+        '--kv-cache-dtype',
         type=str,
-        choices=["auto", "fp8"],
+        choices=['auto', 'fp8', 'fp8_e5m2', 'fp8_e4m3'],
         default="auto",
-        help=
-        'Data type for kv cache storage. If "auto", will use model data type. '
-        'FP8_E5M2 (without scaling) is only supported on cuda version greater '
-        'than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead supported for '
-        'common inference criteria.')
+        help='Data type for kv cache storage. If "auto", will use model '
+        'data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. '
+        'ROCm (AMD GPU) supports fp8 (=fp8_e4m3)')
     parser.add_argument(
         '--quantization-param-path',
         type=str,
@@ -334,9 +349,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help='device type for vLLM execution, supporting CUDA and CPU.')
+        default="auto",
+        choices=["auto", "cuda", "cpu", "openvino", "tpu", "xpu"],
+        help='device type for vLLM execution, supporting CUDA, OpenVINO and '
+        'CPU.')
     parser.add_argument(
         "--enable-prefix-caching",
         action='store_true',
@@ -354,6 +370,41 @@ if __name__ == "__main__":
                         default=None,
                         help='directory to download and load the weights, '
                         'default to the default cache dir of huggingface')
+    parser.add_argument(
+        '--output-json',
+        type=str,
+        default=None,
+        help='Path to save the throughput results in JSON format.')
+    parser.add_argument(
+        '--distributed-executor-backend',
+        choices=['ray', 'mp'],
+        default=None,
+        help='Backend to use for distributed serving. When more than 1 GPU '
+        'is used, will be automatically set to "ray" if installed '
+        'or "mp" (multiprocessing) otherwise.')
+    parser.add_argument(
+        '--load-format',
+        type=str,
+        default=EngineArgs.load_format,
+        choices=[
+            'auto', 'pt', 'safetensors', 'npcache', 'dummy', 'tensorizer',
+            'bitsandbytes'
+        ],
+        help='The format of the model weights to load.\n\n'
+        '* "auto" will try to load the weights in the safetensors format '
+        'and fall back to the pytorch bin format if safetensors format '
+        'is not available.\n'
+        '* "pt" will load the weights in the pytorch bin format.\n'
+        '* "safetensors" will load the weights in the safetensors format.\n'
+        '* "npcache" will load the weights in pytorch format and store '
+        'a numpy cache to speed up the loading.\n'
+        '* "dummy" will initialize the weights with random values, '
+        'which is mainly for profiling.\n'
+        '* "tensorizer" will load the weights using tensorizer from '
+        'CoreWeave. See the Tensorize vLLM Model script in the Examples'
+        'section for more information.\n'
+        '* "bitsandbytes" will load the weights using bitsandbytes '
+        'quantization.\n')
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
