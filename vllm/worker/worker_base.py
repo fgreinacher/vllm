@@ -202,8 +202,7 @@ class LoRANotSupportedWorkerBase(WorkerBase):
         raise ValueError(f"{type(self)} does not support LoRA")
 
     def pin_lora(self, lora_id: int) -> bool:
-        return ValueError(
-            f"{type(self)} does not support LoRA")  # type: ignore
+        raise ValueError(f"{type(self)} does not support LoRA")
 
     def list_loras(self) -> Set[int]:
         raise ValueError(f"{type(self)} does not support LoRA")
@@ -398,7 +397,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         model_input, worker_input, kwargs = inputs
         num_steps = worker_input.num_steps
-        if (execute_model_req is not None and execute_model_req.spec_step_idx):
+        if execute_model_req is not None and execute_model_req.spec_step_idx:
             kwargs["spec_step_idx"] = execute_model_req.spec_step_idx
 
         self.execute_worker(worker_input)
@@ -597,7 +596,8 @@ class WorkerWrapperBase:
 
     def initialize_from_config(self, kv_cache_configs: List[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.rpc_rank]
-        self.worker.initialize_from_config(kv_cache_config)  # type: ignore
+        with set_current_vllm_config(self.vllm_config):
+            self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
     def init_device(self):
         with set_current_vllm_config(self.vllm_config):

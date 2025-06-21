@@ -136,8 +136,8 @@ class Processor:
         Should raise ValueError if unsupported for API Server.
         """
 
-        if not isinstance(params, SamplingParams):
-            raise ValueError("V1 does not yet support Pooling models.")
+        if isinstance(params, PoolingParams):
+            return
 
         self._validate_logprobs(params)
         self._validate_sampling_params(params, lora_request)
@@ -212,6 +212,7 @@ class Processor:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        data_parallel_rank: Optional[int] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
 
         # TODO(woosuk): Support pooling models.
@@ -224,6 +225,12 @@ class Processor:
             raise ValueError("V1 does not support tracing yet.")
         if prompt_adapter_request is not None:
             raise ValueError("V1 does not support prompt_adapter_request.")
+
+        data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_rank is not None and not (0 <= data_parallel_rank <
+                                                   data_parallel_size):
+            raise ValueError(f"data_parallel_rank {data_parallel_rank} "
+                             f"is out of range [0, {data_parallel_size}).")
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -256,18 +263,22 @@ class Processor:
         if encoder_inputs is not None:
             raise NotImplementedError
 
-        assert isinstance(params, SamplingParams)
-        # TODO: can we avoid cloning here in multiproc case?
-        sampling_params = params.clone()
-        # If unset max tokens, then generate up to the max_model_len.
-        if sampling_params.max_tokens is None:
-            sampling_params.max_tokens = (
-                self.model_config.max_model_len -
-                len(decoder_inputs["prompt_token_ids"]))
-        sampling_params.update_from_generation_config(
-            self.generation_config_fields, eos_token_id)
-        sampling_params.update_from_tokenizer(
-            self.tokenizer.get_lora_tokenizer(lora_request))
+        sampling_params = None
+        pooling_params = None
+        if isinstance(params, SamplingParams):
+            # TODO: can we avoid cloning here in multiproc case?
+            sampling_params = params.clone()
+            # If unset max tokens, then generate up to the max_model_len.
+            if sampling_params.max_tokens is None:
+                sampling_params.max_tokens = (
+                    self.model_config.max_model_len -
+                    len(decoder_inputs["prompt_token_ids"]))
+            sampling_params.update_from_generation_config(
+                self.generation_config_fields, eos_token_id)
+            sampling_params.update_from_tokenizer(
+                self.tokenizer.get_lora_tokenizer(lora_request))
+        else:
+            pooling_params = params.clone()
 
         # Multimodal related.
         sorted_mm_inputs: Optional[Sequence[Optional[MultiModalKwargs]]] = None
@@ -324,10 +335,12 @@ class Processor:
             mm_hashes=sorted_mm_hashes,
             mm_placeholders=sorted_mm_positions,
             sampling_params=sampling_params,
+            pooling_params=pooling_params,
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
+            data_parallel_rank=data_parallel_rank,
         )
 
     def _validate_model_inputs(self,
